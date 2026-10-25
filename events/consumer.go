@@ -114,10 +114,12 @@ func HandleWebsocketStream(ctx context.Context, client *ws.Client, sched Schedul
 	remoteAddr := "1.1.1.1" // con.RemoteAddr().String()
 
 	lastSeq := int64(-1)
-	for client.Next() {
-		mt, rawReader := client.Message()
+	for msg, err := range client.Seq(ctx) {
+		if err != nil {
+			return err
+		}
 
-		switch mt {
+		switch msg.Type {
 		default:
 			return fmt.Errorf("expected binary message from subscription endpoint")
 		case websocket.BinaryMessage:
@@ -125,7 +127,7 @@ func HandleWebsocketStream(ctx context.Context, client *ws.Client, sched Schedul
 		}
 
 		r := &instrumentedReader{
-			r:            rawReader,
+			r:            msg.Body,
 			addr:         remoteAddr,
 			bytesCounter: bytesFromStreamCounter.WithLabelValues(remoteAddr),
 		}
@@ -254,7 +256,7 @@ func HandleWebsocketStream(ctx context.Context, client *ws.Client, sched Schedul
 		}
 
 	}
-	return client.Err()
+	return nil
 }
 
 // HandleRepoStream

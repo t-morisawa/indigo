@@ -50,11 +50,13 @@ func runTapc(ctx context.Context, cmd *cli.Command) error {
 	c := websocket.NewClient(ctx, slog.Default(), func() string { return url }, fmt.Sprintf("tapc/%s", versioninfo.Short()))
 	defer c.Close()
 
-	for c.Next() {
-		typ, r := c.Message()
-		switch typ {
+	for msg, err := range c.Seq(ctx) {
+		if err != nil {
+			return err
+		}
+		switch msg.Type {
 		case websocket.TextMessage:
-			body, err := io.ReadAll(r)
+			body, err := io.ReadAll(msg.Body)
 			if err != nil {
 				return fmt.Errorf("failed to read text message: %w", err)
 			}
@@ -63,5 +65,5 @@ func runTapc(ctx context.Context, cmd *cli.Command) error {
 			// ¯\_(ツ)_/¯
 		}
 	}
-	return c.Err()
+	return nil
 }

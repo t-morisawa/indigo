@@ -128,26 +128,11 @@ func (c *Client) Seq(ctx context.Context) iter.Seq2[Message, error] {
 	}
 }
 
-// Next returns true if there is more data to read.
-// If Next returns false, check the Err method for any error encountered.
-func (c *Client) Next() bool { return c.next() }
-
 func (c *Client) next() bool {
 	for c.err == nil && c.pending.typ == 0 {
 		c.state(c)
 	}
 	return c.err == nil
-}
-
-// Err returns any error encountered during reading.
-func (c *Client) Err() error {
-	return c.err
-}
-
-// Message returns the current message value, it is analogous to gorilla/websocket.Conn.NextReader.
-// Calling Message consumes the current message, so subsequent calls to Message will return nil
-func (c *Client) Message() (int, io.Reader) {
-	return c.message().Type, c.message().Body
 }
 
 // message returns the current message and resets the message buffer so that
