@@ -47,7 +47,7 @@ func runTapc(ctx context.Context, cmd *cli.Command) error {
 
 	slog.Info("connecting to TAP server", "url", url)
 
-	c := websocket.NewClient(ctx, slog.Default(), url, fmt.Sprintf("tapc/%s", versioninfo.Short()))
+	c := websocket.NewClient(ctx, slog.Default(), func() string { return url }, fmt.Sprintf("tapc/%s", versioninfo.Short()))
 	defer c.Close()
 
 	for c.Next() {

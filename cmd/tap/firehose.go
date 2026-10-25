@@ -428,12 +428,23 @@ func (fp *FirehoseProcessor) runConsumer(ctx context.Context) error {
 		return fmt.Errorf("failed to read cursor: %w", err)
 	}
 
-	if cursor > 0 {
-		u.RawQuery = fmt.Sprintf("cursor=%d", cursor)
+	// dialURL is evaluated before every dial, so a transparent reconnect
+	// re-reads the cursor saved by the cursor saver instead of replaying from
+	// the URL captured at startup (mirrors the reconnect loop of the
+	// non-iterator consumer in main).
+	dialURL := func() string {
+		if next, err := fp.GetCursor(ctx); err != nil {
+			fp.logger.Warn("failed to re-read cursor, dialing with last known cursor", "error", err, "relayUrl", fp.relayUrl)
+		} else if next > cursor {
+			cursor = next
+		}
+		if cursor > 0 {
+			u.RawQuery = fmt.Sprintf("cursor=%d", cursor)
+		}
+		return u.String()
 	}
-	urlStr := u.String()
 
-	client := websocket.NewClient(ctx, slog.Default(), urlStr, userAgent())
+	client := websocket.NewClient(ctx, slog.Default(), dialURL, userAgent())
 
 	scheduler := parallel.NewScheduler(
 		fp.parallelism,
