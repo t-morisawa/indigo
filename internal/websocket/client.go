@@ -301,8 +301,14 @@ func (c *Client) readState() {
 		c.err = errConnClosed
 		return
 	}
-	c.pending.typ, c.pending.r, c.err = conn.NextReader()
-	if c.err != nil {
+	// NOTE: NextReader returns messageType -1 (gorilla's noFrame) when it
+	// fails, so the pending message must only be committed on success:
+	// writing the -1 through would defeat the "message ready" sentinel in
+	// next() and yield a phantom zero message to the consumer whenever a
+	// connection is transparently reconnected.
+	typ, r, err := conn.NextReader()
+	if err != nil {
+		c.err = err
 		c.logger.Error("websocket read error", "error", c.err, "debug", fmt.Sprintf("%T %+v", c.err, c.err))
 		if shouldReconnect(c.err) {
 			c.logger.Error("websocket connection closed, will reconnect", "error", c.err)
@@ -313,6 +319,7 @@ func (c *Client) readState() {
 		}
 		return
 	}
+	c.pending.typ, c.pending.r = typ, r
 }
 
 func shouldReconnect(err error) bool {
