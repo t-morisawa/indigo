@@ -100,6 +100,8 @@ func NewClient(ctx context.Context, logger *slog.Logger, dialURL func() string, 
 func (c *Client) Seq(ctx context.Context) iter.Seq2[Message, error] {
 	return func(yield func(Message, error) bool) {
 		defer c.cleanup()
+		stopWatchdog := c.startWatchdog(ctx)
+		defer stopWatchdog()
 
 		for {
 			if err := ctx.Err(); err != nil {
@@ -191,6 +193,39 @@ func (c *Client) setConn(conn *websocket.Conn, pingCancel context.CancelFunc) {
 	defer c.connMu.Unlock()
 	c.conn = conn
 	c.pingCancel = pingCancel
+}
+
+// startWatchdog starts a single goroutine that waits for ctx cancellation
+// and, when it fires, unblocks a pending read on the current connection by
+// setting its read deadline in the past. The returned stop function must be
+// called when the iteration ends; it stops the goroutine so it does not leak
+// for the lifetime of ctx.
+//
+// The deadline-past error surfaced by the interrupted read is classified as
+// an i/o timeout, so the state machine takes the transparent reconnect path
+// one last time; the dial then fails fast against the done context and the
+// iteration terminates with the context error, which keeps a cancelled client
+// from being mistaken for a network failure.
+//
+// NOTE: net.Conn documents SetReadDeadline as safe to call concurrently with
+// Read, but gorilla's websocket.Conn is a wrapper around a net.Conn with its
+// own state on top; this concurrency pattern needs review before it is used
+// anywhere more serious than an experiment.
+func (c *Client) startWatchdog(ctx context.Context) (stop func()) {
+	stopped := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-stopped:
+			return
+		}
+		if conn := c.currentConn(); conn != nil {
+			if err := conn.SetReadDeadline(time.Now()); err != nil {
+				c.logger.Warn("watchdog: failed to set read deadline", "error", err)
+			}
+		}
+	}()
+	return func() { close(stopped) }
 }
 
 // currentConn returns the current connection, or nil if there is none.
