@@ -16,10 +16,6 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// errConnClosed is reported when the connection is closed outside of the
-// iteration, for example by a concurrent call to Close.
-var errConnClosed = errors.New("websocket client: connection closed")
-
 const (
 	// TextMessage represents a text data message. The text message payload is
 	// interpreted as UTF-8 encoded text data.
@@ -43,20 +39,11 @@ type Client struct {
 	dialURL   func() string
 	userAgent string
 
-	err error
-
-	state func(*Client)
-
 	dialer          websocket.Dialer
 	connMu          sync.RWMutex
 	conn            *websocket.Conn
 	pingCancel      context.CancelFunc
 	backoffStrategy backoffStrategy
-
-	pending struct {
-		typ int
-		r   io.Reader
-	}
 }
 
 // NewClient returns a client that connects to the URL returned by dialURL.
@@ -77,7 +64,6 @@ func NewClient(ctx context.Context, logger *slog.Logger, dialURL func() string, 
 			multiplier: 1.5,
 			max:        30 * time.Second,
 		},
-		state: (*Client).connectState,
 	}
 }
 
@@ -93,7 +79,8 @@ func NewClient(ctx context.Context, logger *slog.Logger, dialURL func() string, 
 //   - a non-reconnectable error occurs: err is that error.
 //
 // Breaking out of the loop closes the current connection and stops the
-// iteration; a subsequent call to Seq starts a fresh iteration.
+// iteration; a subsequent call to Seq starts a fresh iteration. Only one
+// iteration may use a Client at a time.
 //
 // The ctx argument should be the context handed to NewClient: it drives
 // dialing, backoff, and the ping/pong machinery as well as the iteration.
@@ -109,39 +96,54 @@ func (c *Client) Seq(ctx context.Context) iter.Seq2[Message, error] {
 				yield(Message{}, err)
 				return
 			}
-			if !c.next() {
-				// terminal: fatal error, or the context is done (see
-				// connectState); prefer the context error over any
-				// derivative network error
-				err := c.err
+
+			conn, err := c.connectWithRetry()
+			if err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					err = ctxErr
 				}
 				yield(Message{}, err)
 				return
 			}
-			if !yield(c.message(), nil) {
-				// consumer break: close the connection, do not reconnect
+
+			for {
+				if err := ctx.Err(); err != nil {
+					yield(Message{}, err)
+					return
+				}
+
+				typ, body, err := conn.NextReader()
+				if err == nil {
+					// yield runs the consumer synchronously. Only after it
+					// returns true do we advance the websocket reader.
+					if !yield(Message{Type: typ, Body: body}, nil) {
+						// consumer break: cleanup closes the connection
+						return
+					}
+					continue
+				}
+
+				// Cancellation takes precedence over the timeout generated
+				// by the watchdog (or another network error racing with it).
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					yield(Message{}, ctxErr)
+					return
+				}
+
+				c.logger.Error("websocket read error", "error", err, "debug", fmt.Sprintf("%T %+v", err, err))
+				if shouldReconnect(err) {
+					c.logger.Error("websocket connection closed, will reconnect", "error", err)
+					if closeErr := c.Close(); closeErr != nil {
+						c.logger.Warn("error closing connection", "error", closeErr)
+					}
+					break // outer loop dials a new connection
+				}
+
+				yield(Message{}, err)
 				return
 			}
 		}
 	}
-}
-
-func (c *Client) next() bool {
-	for c.err == nil && c.pending.typ == 0 {
-		c.state(c)
-	}
-	return c.err == nil
-}
-
-// message returns the current message and resets the message buffer so that
-// next() knows to read another one.
-func (c *Client) message() Message {
-	msg := Message{Type: c.pending.typ, Body: c.pending.r}
-	c.pending.typ = 0
-	c.pending.r = nil
-	return msg
 }
 
 // Close closes any resources held by the client. It is safe to call Close
@@ -163,13 +165,11 @@ func (c *Client) Close() error {
 }
 
 // cleanup releases the connection held by a finished iteration and resets the
-// state machine so the client can be iterated again.
+// backoff for a subsequent iteration.
 func (c *Client) cleanup() {
 	if err := c.Close(); err != nil {
 		c.logger.Warn("error closing connection", "error", err)
 	}
-	c.err = nil
-	c.state = (*Client).connectState
 	c.backoffStrategy.Reset()
 }
 
@@ -187,10 +187,9 @@ func (c *Client) setConn(conn *websocket.Conn, pingCancel context.CancelFunc) {
 // for the lifetime of ctx.
 //
 // The deadline-past error surfaced by the interrupted read is classified as
-// an i/o timeout, so the state machine takes the transparent reconnect path
-// one last time; the dial then fails fast against the done context and the
-// iteration terminates with the context error, which keeps a cancelled client
-// from being mistaken for a network failure.
+// an i/o timeout. Seq checks ctx immediately after the read returns, before
+// considering that reconnect path, and terminates with the context error
+// instead of mistaking cancellation for a network failure.
 //
 // NOTE: net.Conn documents SetReadDeadline as safe to call concurrently with
 // Read, but gorilla's websocket.Conn is a wrapper around a net.Conn with its
@@ -220,39 +219,47 @@ func (c *Client) currentConn() *websocket.Conn {
 	return c.conn
 }
 
-func (c *Client) connectState() {
-	attempts := c.backoffStrategy.attempts
-	d := c.backoffStrategy.Next()
-	if attempts > 0 {
-		c.logger.Info("reconnecting", "delay", d, "attempt", attempts)
-	}
-	if err := sleep(c.ctx, d); err != nil {
-		// the context is done while backing off: terminal
-		c.err = err
-		return
-	}
-	url := c.dialURL()
-	c.logger.Info("connecting", "attempt", attempts, "url", url)
-	conn, _, err := c.dialer.DialContext(c.ctx, url, http.Header{
-		"User-Agent": []string{c.userAgent},
-	})
-	if err != nil {
-		c.logger.Warn("connection error", "error", err)
-		if ctxErr := c.ctx.Err(); ctxErr != nil {
-			// the dial failed because the client context is done; keep the
-			// error so the iteration terminates instead of retrying forever
-			c.err = ctxErr
+// connectWithRetry returns a configured connection. Dial failures are
+// transparent while the client context is alive; cancellation and local
+// setup errors terminate the iterator.
+func (c *Client) connectWithRetry() (*websocket.Conn, error) {
+	for {
+		attempts := c.backoffStrategy.attempts
+		d := c.backoffStrategy.Next()
+		if attempts > 0 {
+			c.logger.Info("reconnecting", "delay", d, "attempt", attempts)
 		}
-		// otherwise the failure is transient: retry with backoff
-		return
-	}
-	c.logger.Info("connected", "attempt", attempts)
+		if err := sleep(c.ctx, d); err != nil {
+			return nil, err
+		}
 
+		url := c.dialURL()
+		c.logger.Info("connecting", "attempt", attempts, "url", url)
+		conn, _, err := c.dialer.DialContext(c.ctx, url, http.Header{
+			"User-Agent": []string{c.userAgent},
+		})
+		if err != nil {
+			c.logger.Warn("connection error", "error", err)
+			if ctxErr := c.ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			continue
+		}
+		c.logger.Info("connected", "attempt", attempts)
+
+		if err := c.configureConn(conn); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		c.backoffStrategy.Reset()
+		return conn, nil
+	}
+}
+
+func (c *Client) configureConn(conn *websocket.Conn) error {
 	// set a +1 minute initial read deadline, it will be extended by pings/pongs
 	if err := conn.SetReadDeadline(time.Now().Add(time.Minute)); err != nil {
-		c.err = fmt.Errorf("failed to set read deadline: %w", err)
-		conn.Close()
-		return
+		return fmt.Errorf("failed to set read deadline: %w", err)
 	}
 
 	// The pinger runs on a per-connection context so it stops when the
@@ -264,62 +271,21 @@ func (c *Client) connectState() {
 	// Not sure why. The broader ping/pong design is an open question: see the
 	// original websocket-iterator branch notes.
 	pctx, pingCancel := context.WithCancel(c.ctx)
-	go ticker.Periodically(pctx, 30*time.Second, func(ctx context.Context) error {
-		// TODO(dfc) this is a data race, the whole send a ping without respect to the conn being used elsewhere
-		// needs to be revisited
-		conn := c.currentConn()
-		if conn == nil {
-			return nil
-		}
-		c.logger.Info("sending ping")
-		return conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second))
-	})
-	// pong handler moves the read deadline forward
 	conn.SetPongHandler(func(appData string) error {
 		c.logger.Info("received pong")
 		return conn.SetReadDeadline(time.Now().Add(time.Minute))
 	})
-
-	// setup ping handler for server -> client pings
 	conn.SetPingHandler(func(appData string) error {
 		c.logger.Info("received ping, sending pong")
-		c.err = conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
-		return c.err
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
 	})
 
 	c.setConn(conn, pingCancel)
-
-	c.backoffStrategy.Reset()
-	c.state = (*Client).readState
-}
-
-func (c *Client) readState() {
-	conn := c.currentConn()
-	if conn == nil {
-		// the connection was closed out from under us (see Close); treat it
-		// as fatal rather than something to reconnect from
-		c.err = errConnClosed
-		return
-	}
-	// NOTE: NextReader returns messageType -1 (gorilla's noFrame) when it
-	// fails, so the pending message must only be committed on success:
-	// writing the -1 through would defeat the "message ready" sentinel in
-	// next() and yield a phantom zero message to the consumer whenever a
-	// connection is transparently reconnected.
-	typ, r, err := conn.NextReader()
-	if err != nil {
-		c.err = err
-		c.logger.Error("websocket read error", "error", c.err, "debug", fmt.Sprintf("%T %+v", c.err, c.err))
-		if shouldReconnect(c.err) {
-			c.logger.Error("websocket connection closed, will reconnect", "error", c.err)
-			// closes the connection and stops its pinger
-			c.Close()
-			c.err = nil
-			c.state = (*Client).connectState
-		}
-		return
-	}
-	c.pending.typ, c.pending.r = typ, r
+	go ticker.Periodically(pctx, 30*time.Second, func(ctx context.Context) error {
+		c.logger.Info("sending ping")
+		return conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second))
+	})
+	return nil
 }
 
 func shouldReconnect(err error) bool {
